@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -86,4 +88,103 @@ func TestParseUnitShowAndProm(t *testing.T) {
 	if _, err := parsePromValue("vector", json.RawMessage(`[]`)); err == nil {
 		t.Error("没有序列应当报错")
 	}
+}
+
+// TestNodeSlotsGateAndWait 验证 O2 的核心：有空位直接进拉镜像；空位不足进入等待；
+// 同一轮不重复发起等待；到点后一次性放行。用很短的延迟，不真等 240s。
+func TestNodeSlotsGateAndWait(t *testing.T) {
+	o := options{NodeSlots: 2, Data: t.TempDir(), Version: "v1", BasePort: 8101}
+	o.nodeDelay, o.pull = 30*time.Millisecond, 5*time.Millisecond
+	s, err := newScaler(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	a := s.create("v1", false, "t")
+	b := s.create("v1", false, "t")
+	if a.state != stPulling || b.state != stPulling {
+		t.Errorf("有空位时应直接进拉镜像，得到 %s/%s", a.state, b.state)
+	}
+	if s.nodeSlots != 0 {
+		t.Errorf("两个实例应耗尽空位，剩 %d", s.nodeSlots)
+	}
+	c := s.create("v1", false, "t") // 第 3 个：无空位
+	if c.state != stPendingNode || !c.pendingNode {
+		t.Errorf("空位不足应等待节点，得到 %s", c.state)
+	}
+	first := s.nodePrepUntil
+	d := s.create("v1", false, "t") // 第 4 个：加入同一轮
+	if !s.nodePrepUntil.Equal(first) {
+		t.Error("同一轮不应重置等待时刻（不重复请求节点）")
+	}
+	if len(s.nodePending) != 2 {
+		t.Errorf("应有 2 个在等待，得到 %d", len(s.nodePending))
+	}
+	s.nodeAdvance(time.Now()) // 未到点
+	if c.state != stPendingNode {
+		t.Error("等待未到点不应放行")
+	}
+	s.mu.Unlock()
+
+	time.Sleep(40 * time.Millisecond)
+	s.mu.Lock()
+	s.nodeAdvance(time.Now()) // 到点
+	if c.state != stPulling || d.state != stPulling {
+		t.Errorf("节点就绪后应进入拉镜像，得到 %s/%s", c.state, d.state)
+	}
+	if len(s.nodePending) != 0 || !s.nodePrepUntil.IsZero() {
+		t.Error("放行后应清空本轮")
+	}
+	s.mu.Unlock()
+}
+
+// TestNodeDisabledByDefault 验证默认关闭：不设 -node-slots 时所有实例直接进拉镜像，
+// 且不生成 node-events.csv（保证对成员3/4/5 零影响）。
+func TestNodeDisabledByDefault(t *testing.T) {
+	dir := t.TempDir()
+	o := options{NodeSlots: 0, Data: dir, Version: "v1", BasePort: 8101}
+	o.pull = time.Second
+	s, err := newScaler(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	for i := 0; i < 5; i++ {
+		if in := s.create("v1", false, "t"); in.state != stPulling {
+			t.Errorf("关闭节点模拟时第 %d 个应直接进拉镜像，得到 %s", i, in.state)
+		}
+	}
+	s.mu.Unlock()
+	if _, err := os.Stat(filepath.Join(dir, "node-events.csv")); !os.IsNotExist(err) {
+		t.Error("关闭时不应生成 node-events.csv")
+	}
+}
+
+// TestNodeSlotReleaseOnForget 验证空位归还与取消等待：占位实例离开后归还空位；
+// 等待中的实例离开后清空本轮，不遗留任务。
+func TestNodeSlotReleaseOnForget(t *testing.T) {
+	o := options{NodeSlots: 1, Data: t.TempDir(), Version: "v1", BasePort: 8101}
+	o.nodeDelay, o.pull = time.Millisecond, time.Millisecond
+	s, err := newScaler(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	a := s.create("v1", false, "t") // 占掉唯一空位
+	if s.nodeSlots != 0 {
+		t.Fatalf("空位应被占用，剩 %d", s.nodeSlots)
+	}
+	b := s.create("v1", false, "t") // 无空位，等待
+	if b.state != stPendingNode {
+		t.Fatalf("应等待节点，得到 %s", b.state)
+	}
+	s.forget(a) // a 离开，归还空位
+	if s.nodeSlots != 1 {
+		t.Errorf("应释放空位，剩 %d", s.nodeSlots)
+	}
+	s.forget(b) // b 是等待中的，forget 后应清空本轮
+	if len(s.nodePending) != 0 || !s.nodePrepUntil.IsZero() {
+		t.Error("等待实例离开后应取消本轮")
+	}
+	s.mu.Unlock()
 }

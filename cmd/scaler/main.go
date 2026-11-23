@@ -46,6 +46,8 @@ import (
 )
 
 type options struct {
+	NodeSlots  int     `json:"node_slots"` // O2：初始节点空位数；0=关闭（默认）
+	NodeDelay  string  `json:"node_delay"` // O2：空位不足时等待时长（字符串，供 /config 展示）
 	Mode       string  `json:"mode"`
 	Replicas   int     `json:"replicas"`
 	Min        int     `json:"min"`
@@ -73,8 +75,8 @@ type options struct {
 	Admin      string  `json:"admin"`
 	Started    string  `json:"started"`
 
-	sync, downWindow, pull time.Duration
-	schedule               []schedEntry
+	sync, downWindow, pull, nodeDelay time.Duration
+	schedule                          []schedEntry
 }
 
 type schedEntry struct {
@@ -84,31 +86,38 @@ type schedEntry struct {
 
 // 实例的状态
 const (
-	stPulling  = "pulling"  // 已创建，模拟拉镜像
-	stStarting = "starting" // 进程已启动，等就绪
-	stReady    = "ready"    // lbd 判为健康，接流量
-	stStopping = "stopping" // 排空、停止中
+	stPendingNode = "pending-node" // O2：已决定创建，但无空节点位，等待节点准备
+	stPulling     = "pulling"      // 已创建，模拟拉镜像
+	stStarting    = "starting"     // 进程已启动，等就绪
+	stReady       = "ready"        // lbd 判为健康，接流量
+	stStopping    = "stopping"     // 排空、停止中
 )
 
 type instance struct {
-	port      int
-	addr      string
-	unit      string
-	version   string
-	state     string
-	created   time.Time
-	pullUntil time.Time
-	assumeUp  bool // 登记到 lbd 时直接视为健康（任务 D1 的“直接替换”）
-	restarts  int
-	startedAt time.Time
+	pendingNode bool // O2：正在等待节点
+	holdsSlot   bool // O2：占用了一个节点空位（forget 时据此归还）
+	port        int
+	addr        string
+	unit        string
+	version     string
+	state       string
+	created     time.Time
+	pullUntil   time.Time
+	assumeUp    bool // 登记到 lbd 时直接视为健康（任务 D1 的“直接替换”）
+	restarts    int
+	startedAt   time.Time
 }
 
 type scaler struct {
-	opt   options
-	mu    sync.Mutex
-	insts []*instance
-	hist  []histEntry // 最近的期望数，用于缩容的稳定窗口
-	busy  bool        // 正在滚动发布，暂停决策
+	nodeLog       *csvLog     // O2：node-events.csv；关闭时为 nil，不生成文件
+	nodeSlots     int         // O2：当前可用空位
+	nodePending   []*instance // O2：本轮等待节点的实例
+	nodePrepUntil time.Time   // O2：本轮节点准备完成时刻；零值=没有进行中的轮次
+	opt           options
+	mu            sync.Mutex
+	insts         []*instance
+	hist          []histEntry // 最近的期望数，用于缩容的稳定窗口
+	busy          bool        // 正在滚动发布，暂停决策
 
 	runStart time.Time
 	runMtime time.Time
@@ -149,8 +158,10 @@ func main() {
 	flag.StringVar(&o.LB, "lb", "http://127.0.0.1:8090", "lbd 的管理接口")
 	flag.StringVar(&o.Prom, "prom", "http://127.0.0.1:9090", "Prometheus 的地址")
 	flag.StringVar(&o.Admin, "admin", "127.0.0.1:8091", "scaler 自己的管理接口")
+	flag.IntVar(&o.NodeSlots, "node-slots", 0, "O2 选做：初始节点空位数；0=关闭（默认，行为与原版完全一致）；>0 时扩容超过空位会先等 -node-delay 准备节点再拉镜像")
+	flag.DurationVar(&o.nodeDelay, "node-delay", 0, "O2 选做：空位不足时准备节点的等待时长，例如 240s；仅当 -node-slots>0 生效")
 	flag.Parse()
-	o.Sync, o.DownWindow, o.Pull = o.sync.String(), o.downWindow.String(), o.pull.String()
+	o.Sync, o.DownWindow, o.Pull, o.NodeDelay = o.sync.String(), o.downWindow.String(), o.pull.String(), o.nodeDelay.String()
 	o.Started = time.Now().Format(time.RFC3339)
 	if err := o.check(); err != nil {
 		log.Fatal(err)
@@ -297,7 +308,16 @@ func newScaler(o options) (*scaler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &scaler{opt: o, decLog: dl, instLog: il, http: &http.Client{Timeout: 3 * time.Second}}, nil
+	var nl *csvLog
+	if o.NodeSlots > 0 { // 只有开启节点模拟才建 node-events.csv；关闭时其他成员的 run 里不会出现它
+		nl, err = openCSV(filepath.Join(o.Data, "node-events.csv"),
+			[]string{"unix_ms", "time", "t_run", "instance", "event", "detail", "free_slots", "pending"})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &scaler{opt: o, decLog: dl, instLog: il, nodeLog: nl, nodeSlots: o.NodeSlots,
+		http: &http.Client{Timeout: 3 * time.Second}}, nil
 }
 
 func (s *scaler) describe() string {
@@ -361,6 +381,7 @@ func (s *scaler) reconcile() {
 	s.mu.Lock()
 	var dead []*instance
 	now := time.Now()
+	s.nodeAdvance(now) // ← O2 新增：到点放行等待节点的实例（关闭时立即返回）
 	for _, in := range s.insts {
 		switch in.state {
 		case stPulling:
@@ -433,6 +454,17 @@ func (s *scaler) activeCount() int {
 
 func (s *scaler) forget(in *instance) {
 	s.insts = slices.DeleteFunc(s.insts, func(x *instance) bool { return x == in })
+	if s.nodeEnabled() {
+		if in.holdsSlot {
+			s.nodeSlots++
+			in.holdsSlot = false
+			s.nodeLogWrite(in, "slot-released", "实例离开，释放节点空位")
+		}
+		s.nodePending = slices.DeleteFunc(s.nodePending, func(x *instance) bool { return x == in })
+		if len(s.nodePending) == 0 {
+			s.nodePrepUntil = time.Time{} // 等待队列空了就取消本轮，避免空轮次触发
+		}
+	}
 }
 
 // decide 是一次伸缩决策。
@@ -495,7 +527,7 @@ func (s *scaler) decide() {
 
 // pickVictim 选一个要缩掉的实例：先缩还没就绪的、后创建的。调用者持有锁。
 func (s *scaler) pickVictim() *instance {
-	rank := map[string]int{stPulling: 0, stStarting: 1, stReady: 2}
+	rank := map[string]int{stPendingNode: 0, stPulling: 0, stStarting: 1, stReady: 2}
 	var best *instance
 	for _, in := range s.insts {
 		if in.state == stStopping {
@@ -511,6 +543,45 @@ func (s *scaler) pickVictim() *instance {
 	return best
 }
 
+// nodeEnabled 报告是否开启了 O2 的节点空位模拟。默认关闭时下面所有节点逻辑都短路，
+// create/reconcile/retire 走的就是原版路径，行为与原版一致。
+func (s *scaler) nodeEnabled() bool { return s.opt.NodeSlots > 0 }
+
+// nodeLogWrite 写一行 node-events.csv；关闭时 nodeLog 为 nil，直接返回。调用者持有锁。
+func (s *scaler) nodeLogWrite(in *instance, ev, detail string) {
+	if s.nodeLog == nil {
+		return
+	}
+	now := time.Now()
+	who := ""
+	if in != nil {
+		who = in.addr
+	}
+	s.nodeLog.write(strconv.FormatInt(now.UnixMilli(), 10), now.Format("15:04:05.000"), s.tRun(now),
+		who, ev, detail, strconv.Itoa(s.nodeSlots), strconv.Itoa(len(s.nodePending)))
+}
+
+// nodeAdvance 每秒由 reconcile 调用：本轮节点准备到点后，一次性给所有等待的实例补空位并放行到拉镜像。
+// 不阻塞、不 sleep，只比较时间戳。调用者持有锁。
+func (s *scaler) nodeAdvance(now time.Time) {
+	if !s.nodeEnabled() || s.nodePrepUntil.IsZero() || now.Before(s.nodePrepUntil) {
+		return
+	}
+	added := len(s.nodePending)
+	s.nodeSlots += added
+	s.nodeLogWrite(nil, "node-available", fmt.Sprintf("节点准备完成，本轮新增 %d 个空位", added))
+	for _, in := range s.nodePending {
+		s.nodeSlots--
+		in.holdsSlot = true
+		in.pendingNode = false
+		in.state = stPulling
+		in.pullUntil = now.Add(s.opt.pull)
+		s.nodeLogWrite(in, "pull-start", "节点就绪，开始拉镜像")
+	}
+	s.nodePending = nil
+	s.nodePrepUntil = time.Time{}
+}
+
 // create 新建一个实例（先模拟拉镜像）。调用者持有锁。
 func (s *scaler) create(version string, assumeUp bool, why string) *instance {
 	port := s.opt.BasePort
@@ -520,6 +591,24 @@ func (s *scaler) create(version string, assumeUp bool, why string) *instance {
 	now := time.Now()
 	in := &instance{port: port, addr: "127.0.0.1:" + strconv.Itoa(port), unit: fmt.Sprintf("lab3-inst-%d", port),
 		version: version, state: stPulling, created: now, pullUntil: now.Add(s.opt.pull), assumeUp: assumeUp}
+	if s.nodeEnabled() { // ← O2 新增：空位闸门
+		if s.nodeSlots > 0 {
+			s.nodeSlots-- // 立即预留，避免并发竞争
+			in.holdsSlot = true
+			s.nodeLogWrite(in, "slot-taken", "有空位，直接进入拉镜像")
+		} else {
+			in.state = stPendingNode
+			in.pullUntil = time.Time{}
+			in.pendingNode = true
+			s.nodePending = append(s.nodePending, in)
+			if s.nodePrepUntil.IsZero() {
+				s.nodePrepUntil = now.Add(s.opt.nodeDelay) // 本轮第一个：开启等待
+				s.nodeLogWrite(in, "node-requested", fmt.Sprintf("无空位，发起节点准备，预计等待 %v", s.opt.nodeDelay))
+			} else {
+				s.nodeLogWrite(in, "node-requested", "加入本轮节点准备，不重复发起等待")
+			}
+		}
+	}
 	s.insts = append(s.insts, in)
 	s.logInst(in, "created", why)
 	return in
@@ -566,9 +655,17 @@ func (s *scaler) startUnit(in *instance) error {
 // retire 停掉一个实例。graceful 为真时先在 lbd 里排空、等在途请求做完，再 SIGTERM；否则直接 SIGKILL。
 func (s *scaler) retire(in *instance, graceful bool) {
 	s.mu.Lock()
+	pending := in.pendingNode // ← O2：还在等节点，进程从未启动
 	in.state = stStopping
-	pulling := in.pullUntil.After(time.Now()) && in.restarts == 0
+	pulling := !pending && in.pullUntil.After(time.Now()) && in.restarts == 0
 	s.mu.Unlock()
+	if pending { // ← O2 新增：直接取消，不去 systemctl（单元根本没起）
+		s.mu.Lock()
+		s.logInst(in, "stopped", "还在等节点，直接取消")
+		s.forget(in)
+		s.mu.Unlock()
+		return
+	}
 	if pulling && unitState(in.unit).active == "" {
 		s.mu.Lock()
 		s.logInst(in, "stopped", "还在拉镜像，直接取消")
@@ -863,7 +960,7 @@ func (s *scaler) writeTargets() {
 	s.mu.Lock()
 	targets := []string{}
 	for _, in := range s.insts {
-		if in.state != stPulling {
+		if in.state != stPulling && in.state != stPendingNode { // 等待节点的实例还没有进程，不抓
 			targets = append(targets, in.addr)
 		}
 	}
