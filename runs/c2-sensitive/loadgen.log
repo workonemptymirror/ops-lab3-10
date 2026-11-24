@@ -1,0 +1,6 @@
+loadgen：GET http://127.0.0.1:8080/api/courses/1，1 个阶段共 2m0s，到达过程 poisson，超时 2s，GOMAXPROCS=1
+阶段 1/1：目标 168 请求/秒，已发出 20360，已成功 20018，在途 2，压测机 CPU 2%
+等待在途的 2 个请求结束（最多 2s）…
+step  target_rps   sent     ok  error_rate  mean_ms  p50_ms  p99_ms   max_ms  slo_good  lag_p99_ms  gen_cpu_pct  
+   1         168  20360  20020      0.0167    15.94    5.44   14.98  1993.88    0.9780        1.10            2  
+ all              20360  20020      0.0167    15.94    5.44   14.98  1993.88    0.9780        1.10            2  
