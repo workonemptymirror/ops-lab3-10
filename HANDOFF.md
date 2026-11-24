@@ -89,3 +89,23 @@ sudo taskset -c 0 bin/scaler -mode reactive -min 2 -max 4 -cpus 1 -signal "$CPU"
 2. 终端 C：`sudo taskset -c 0 bin/scaler -mode fixed -replicas 3 -cpus 1`，等 3 个实例就绪（`curl -s 127.0.0.1:8090/backends` 三个 up:true，约 85 s）。
 3. 终端 D：`export GEN_CPUS=0`；C1 负载：`scripts/run3.sh c1-stop -url http://127.0.0.1:8080/api/courses/1 -plan 168@240s`。
 4. 按分工，成员 2 此后不再返回参加 O3/O4；有疑问看本文件与 `LAB3.md` 第 3 节、7.1 节。
+
+## 成员 3（任务 C1/C2）→ 成员 4 ｜ 2026-11-24
+
+1. 完成状态与报告位置
+任务 C1（停止与卡住）、C2（暂停）已完成。
+数据目录：`runs/c1-stop/`、`runs/c2-default/`、`runs/c2-sensitive/`。
+报告：`LAB3.md` 第 4 节、第 6 节问题 3 已填。
+
+2. 关键数字（C3 配额计算依据）
+在 C1 负载 168 RPS（3 实例）下，从 Prometheus 查得单实例 CPU 用量 U ≈ 0.14 core。
+建议的 C3 慢速配额 = 100 × 0.14 / 0.85 ≈ 16%（取整 15% 或 16%）。
+
+3. 交接时的服务状态
+- lbd 已恢复默认参数（无 -outlier，检查间隔 1s）。
+- scaler 以 `-mode fixed -replicas 3` 运行，3 个实例（8101, 8102, 8103）均 up。
+- 当前无负载压测。
+
+4. 成员 4 的第一步
+- 先确认 `curl -s 127.0.0.1:8090/backends` 显示 3 个 up。
+- 按 C3 指导书，使用 U=0.14, 配额 16% 进行注入：`sudo scripts/inject.sh slow 8102 16`。
